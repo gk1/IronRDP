@@ -462,7 +462,6 @@ impl ChunkProcessor {
         let mut chunks = Vec::new();
 
         let total_len = encoded_pdu.filled_len();
-        let is_chunked = total_len > max_chunk_len;
         let mut chunk_start_index: usize = 0;
         let mut chunk_end_index = core::cmp::min(total_len, max_chunk_len);
         loop {
@@ -485,10 +484,12 @@ impl ChunkProcessor {
                 if last {
                     flags |= ChannelFlags::LAST;
                 }
-                if is_chunked {
-                    flags |= ChannelFlags::SHOW_PROTOCOL;
-                }
-
+                // Header visibility belongs to the channel, not the message
+                // size. In particular, Windows RDPDR expects the reassembled
+                // device response without channel headers. Adding SHOW_PROTOCOL
+                // only when a read is fragmented makes Windows reject the drive
+                // after the first large read. Channels such as CLIPRDR explicitly
+                // request SHOW_PROTOCOL through SvcMessage::with_flags.
                 flags |= message.flags;
 
                 ChannelPduHeader {

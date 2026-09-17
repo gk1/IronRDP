@@ -244,15 +244,63 @@ fn static_channel_rejects_malformed_chunk_sequences() {
 }
 
 #[test]
-fn static_channel_chunks_show_protocol_header() {
-    let chunks = StaticVirtualChannel::chunkify(vec![SvcMessage::from(vec![0; CHANNEL_CHUNK_LENGTH + 1])])
-        .expect("static channel message should chunk");
-
-    assert_eq!(chunks.len(), 2);
-    for chunk in chunks {
-        let header = decode::<ChannelPduHeader>(chunk.filled()).expect("channel header should decode");
-        assert!(header.flags.contains(ChannelControlFlags::FLAG_SHOW_PROTOCOL));
+fn static_channel_fragmentation_preserves_explicit_header_visibility() {
+    for length in [CHANNEL_CHUNK_LENGTH, CHANNEL_CHUNK_LENGTH + 1, 32_788] {
+        for show_protocol in [false, true] {
+            let flags = if show_protocol {
+                ironrdp_svc::ChannelFlags::SHOW_PROTOCOL
+            } else {
+                ironrdp_svc::ChannelFlags::empty()
+            };
+            let chunks = StaticVirtualChannel::chunkify(vec![SvcMessage::from(vec![0; length]).with_flags(flags)])
+                .expect("static channel message should chunk");
+            for chunk in chunks {
+                let header = decode::<ChannelPduHeader>(chunk.filled()).expect("channel header should decode");
+                assert_eq!(
+                    header.flags.contains(ChannelControlFlags::FLAG_SHOW_PROTOCOL),
+                    show_protocol,
+                    "fragmentation must not change endpoint header visibility (payload {length})"
+                );
+            }
+        }
     }
+}
+
+#[test]
+fn fragmented_drive_read_preserves_payload_and_completion_without_exposing_headers() {
+    use ironrdp_rdpdr::pdu::RdpdrPdu;
+    use ironrdp_rdpdr::pdu::efs::{DeviceIoResponse, DeviceReadResponse, NtStatus};
+
+    let response = RdpdrPdu::DeviceReadResponse(DeviceReadResponse {
+        device_io_reply: DeviceIoResponse {
+            device_id: 7,
+            completion_id: 19,
+            io_status: NtStatus::SUCCESS,
+        },
+        read_data: (0..32_768)
+            .map(|i| u8::try_from(i % 251).expect("bounded byte"))
+            .collect(),
+    });
+    let expected = encode_vec(&response).expect("read response should encode");
+    let chunks = StaticVirtualChannel::chunkify(vec![SvcMessage::from(response)]).expect("read should chunk");
+    assert!(chunks.len() > 1);
+    let mut reassembled = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let mut cursor = ReadCursor::new(chunk.filled());
+        let header: ChannelPduHeader = decode_cursor(&mut cursor).expect("channel header should decode");
+        assert_eq!(usize::try_from(header.length).expect("length fits"), expected.len());
+        assert_eq!(header.flags.contains(ChannelControlFlags::FLAG_FIRST), index == 0);
+        assert_eq!(
+            header.flags.contains(ChannelControlFlags::FLAG_LAST),
+            index + 1 == chunks.len()
+        );
+        assert!(
+            !header.flags.contains(ChannelControlFlags::FLAG_SHOW_PROTOCOL),
+            "Windows RDPDR must receive the reassembled read response, without transport headers"
+        );
+        reassembled.extend_from_slice(cursor.remaining());
+    }
+    assert_eq!(reassembled, expected);
 }
 
 #[test]
@@ -303,21 +351,13 @@ fn reactivated_session_applies_the_static_channel_chunk_size() {
     assert_eq!(first.0.initiator_id, 1002);
     assert_eq!(first_header.length, 4097);
     assert_eq!(first.0.user_data.len() - 8, 4096);
-    assert!(
-        first_header
-            .flags
-            .contains(ChannelControlFlags::FLAG_FIRST | ChannelControlFlags::FLAG_SHOW_PROTOCOL)
-    );
+    assert!(first_header.flags.contains(ChannelControlFlags::FLAG_FIRST));
     assert!(!first_header.flags.contains(ChannelControlFlags::FLAG_LAST));
 
     let second_header = decode::<ChannelPduHeader>(second.0.user_data.as_ref()).expect("second header should decode");
     assert_eq!(second_header.length, 4097);
     assert_eq!(second.0.user_data.len() - 8, 1);
-    assert!(
-        second_header
-            .flags
-            .contains(ChannelControlFlags::FLAG_LAST | ChannelControlFlags::FLAG_SHOW_PROTOCOL)
-    );
+    assert!(second_header.flags.contains(ChannelControlFlags::FLAG_LAST));
     assert!(!second_header.flags.contains(ChannelControlFlags::FLAG_FIRST));
 
     let shutdown = active_stage
