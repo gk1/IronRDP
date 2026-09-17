@@ -31,6 +31,7 @@ use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_P
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+use ironrdp_svc::SvcProcessorMessages;
 use ironrdp_core::WriteBuf;
 use ironrdp_futures::{FramedWrite, single_sequence_step_read};
 use rgb::AsPixels as _;
@@ -41,8 +42,10 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlCanvasElement;
 
 use crate::canvas::Canvas;
+use crate::audio::{AudioBackendMessage, JsAudioCallbacks, WasmAudio, WasmAudioBackend, wasm_audio_pair};
 use crate::clipboard;
 use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
+use crate::drive::{DriveSeedFile, JsDriveCallbacks, WasmDrive, WasmRdpdrBackend, wasm_drive_pair};
 use crate::error::IronError;
 use crate::image::extract_partial_image;
 use crate::input::InputTransaction;
@@ -67,6 +70,7 @@ struct SessionBuilderInner {
     kdc_proxy_url: Option<String>,
     client_name: String,
     desktop_size: DesktopSize,
+    monitor_layout: Option<ironrdp::pdu::gcc::ClientMonitorData>,
 
     render_canvas: Option<HtmlCanvasElement>,
     set_cursor_style_callback: Option<js_sys::Function>,
@@ -88,6 +92,11 @@ struct SessionBuilderInner {
     printer_name: Option<String>,
     printer_device_id: Option<u32>,
     printer_driver_name: Option<String>,
+    drive_files: Vec<DriveSeedFile>,
+    invalid_drive_callbacks: bool,
+    drive_callbacks: Option<JsDriveCallbacks>,
+    invalid_audio_playback_callbacks: bool,
+    audio_playback_callbacks: Option<JsAudioCallbacks>,
 
     use_display_control: bool,
     enable_credssp: bool,
@@ -113,6 +122,7 @@ impl Default for SessionBuilderInner {
                 width: DEFAULT_WIDTH,
                 height: DEFAULT_HEIGHT,
             },
+            monitor_layout: None,
 
             render_canvas: None,
             set_cursor_style_callback: None,
@@ -132,6 +142,11 @@ impl Default for SessionBuilderInner {
             printer_name: None,
             printer_device_id: None,
             printer_driver_name: None,
+            drive_files: Vec::new(),
+            invalid_drive_callbacks: false,
+            drive_callbacks: None,
+            invalid_audio_playback_callbacks: false,
+            audio_playback_callbacks: None,
 
             use_display_control: false,
             enable_credssp: true,
@@ -254,6 +269,12 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |vmconnect: String| { self.0.borrow_mut().vmconnect = Some(vmconnect) };
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
+            |monitor_layout: JsValue| {
+                match parse_monitor_layout(monitor_layout) {
+                    Ok(layout) => self.0.borrow_mut().monitor_layout = Some(layout),
+                    Err(error) => warn!(%error, "Ignoring invalid browser monitor layout"),
+                }
+            };
             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
             |enable_server_pointer: bool| { self.0.borrow_mut().enable_server_pointer = enable_server_pointer };
             |legacy_graphics: bool| { self.0.borrow_mut().legacy_graphics = legacy_graphics };
@@ -304,6 +325,27 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     }
                 }
             };
+            |drive_file_callbacks: JsValue| {
+                let mut inner = self.0.borrow_mut();
+                match parse_drive_callbacks(drive_file_callbacks) {
+                    Ok(callbacks) => { inner.invalid_drive_callbacks = false; inner.drive_callbacks = Some(callbacks); }
+                    Err(error) => { inner.invalid_drive_callbacks = true; inner.drive_callbacks = None; warn!(%error, "Invalid drive_file_callbacks; drive redirection requires onFileWritten"); }
+                }
+            };
+            |audio_playback_callbacks: JsValue| {
+                let mut inner = self.0.borrow_mut();
+                match parse_audio_playback_callbacks(audio_playback_callbacks) {
+                    Ok(callbacks) => {
+                        inner.invalid_audio_playback_callbacks = false;
+                        inner.audio_playback_callbacks = Some(callbacks);
+                    }
+                    Err(error) => {
+                        inner.invalid_audio_playback_callbacks = true;
+                        inner.audio_playback_callbacks = None;
+                        warn!(%error, "Invalid audio_playback_callbacks; audio playback requires onPcm");
+                    }
+                }
+            };
             |printer_name: String| {
                 let mut inner = self.0.borrow_mut();
                 inner.printer_name = if printer_name.is_empty() { None } else { Some(printer_name) };
@@ -327,6 +369,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     Some(printer_driver_name)
                 };
             };
+            |drive_files: JsValue| {
+                self.0.borrow_mut().drive_files = parse_drive_seed_files(drive_files).unwrap_or_default();
+            };
         }
 
         self.clone()
@@ -345,6 +390,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             kdc_proxy_url,
             client_name,
             desktop_size,
+            monitor_layout,
             render_canvas,
             set_cursor_style_callback,
             set_cursor_style_callback_context,
@@ -362,6 +408,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_name,
             printer_device_id,
             printer_driver_name,
+            drive_files,
+            invalid_drive_callbacks,
+            drive_callbacks,
+            invalid_audio_playback_callbacks,
+            audio_playback_callbacks,
             outbound_message_size_limit,
             legacy_graphics,
         );
@@ -380,6 +431,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             kdc_proxy_url = inner.kdc_proxy_url.clone();
             client_name = inner.client_name.clone();
             desktop_size = inner.desktop_size;
+            monitor_layout = inner.monitor_layout.clone();
 
             render_canvas = inner.render_canvas.clone().context("render_canvas missing")?;
 
@@ -405,6 +457,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_name = inner.printer_name.clone();
             printer_device_id = inner.printer_device_id;
             printer_driver_name = inner.printer_driver_name.clone();
+            drive_files = inner.drive_files.clone();
+            invalid_drive_callbacks = inner.invalid_drive_callbacks;
+            drive_callbacks = inner.drive_callbacks.clone();
+            invalid_audio_playback_callbacks = inner.invalid_audio_playback_callbacks;
+            audio_playback_callbacks = inner.audio_playback_callbacks.clone();
             outbound_message_size_limit = inner.outbound_message_size_limit;
             legacy_graphics = inner.legacy_graphics;
         }
@@ -421,7 +478,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             server_domain,
             client_name.clone(),
             desktop_size,
+            monitor_layout,
             legacy_graphics,
+            audio_playback_callbacks.is_some(),
         );
 
         let enable_credssp = self.0.borrow().enable_credssp;
@@ -454,6 +513,14 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                 "printer redirection requires valid print_job_stream_callbacks"
             )));
         }
+        if !drive_files.is_empty() && invalid_drive_callbacks {
+            return Err(IronError::from(anyhow::anyhow!("drive redirection requires valid drive_file_callbacks")));
+        }
+        if invalid_audio_playback_callbacks {
+            return Err(IronError::from(anyhow::anyhow!(
+                "audio playback requires valid audio_playback_callbacks"
+            )));
+        }
 
         // Build the virtual-printer pair when JS printer callbacks were
         // registered via extension(). Backend is Send (holds the mpsc proxy
@@ -463,6 +530,18 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             Some(callbacks) => {
                 let (backend, printer) = wasm_printer_pair(input_events_tx.clone(), callbacks);
                 (Some(backend), Some(printer))
+            }
+            None => (None, None),
+        };
+        let (drive_backend, drive) = match (drive_files.is_empty(), drive_callbacks) {
+            (true, _) => (None, None),
+            (false, Some(callbacks)) => { let (backend, drive) = wasm_drive_pair(input_events_tx.clone(), drive_files, callbacks); (Some(backend), Some(drive)) }
+            (false, None) => return Err(IronError::from(anyhow::anyhow!("drive redirection requires drive_file_callbacks"))),
+        };
+        let (audio_backend, audio) = match audio_playback_callbacks {
+            Some(callbacks) => {
+                let (backend, audio) = wasm_audio_pair(input_events_tx.clone(), callbacks);
+                (Some(backend), Some(audio))
             }
             None => (None, None),
         };
@@ -514,6 +593,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             printer_device_id,
             printer_name,
             printer_driver_name,
+            drive_backend,
+            audio_backend,
             computer_name: client_name.clone(),
             use_display_control,
         })
@@ -542,6 +623,8 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             connection_result: RefCell::new(Some(connection_result)),
             clipboard: RefCell::new(Some(clipboard)),
             printer: RefCell::new(Some(printer)),
+            drive: RefCell::new(Some(drive)),
+            audio: RefCell::new(Some(audio)),
         })
     }
 }
@@ -555,6 +638,9 @@ pub(crate) enum RdpInputEvent {
     /// Printer backend → event loop: a print job finished and its bytes are
     /// ready for delivery to JS. See [`crate::printer::PrinterBackendMessage`].
     Printer(crate::printer::PrinterBackendMessage),
+    Drive(crate::drive::DriveBackendMessage),
+    DriveReadResponse { request_id: u32, data: Vec<u8>, failed: bool },
+    Audio(AudioBackendMessage),
     FastPath(FastPathInputEvents),
     Resize {
         width: u32,
@@ -591,6 +677,8 @@ pub(crate) struct Session {
     rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
     clipboard: RefCell<Option<Option<WasmClipboard>>>,
     printer: RefCell<Option<Option<WasmPrinter>>>,
+    drive: RefCell<Option<Option<WasmDrive>>>,
+    audio: RefCell<Option<Option<WasmAudio>>>,
 }
 
 impl Session {
@@ -660,6 +748,8 @@ impl iron_remote_desktop::Session for Session {
 
         let mut clipboard = self.clipboard.borrow_mut().take().expect("run called only once");
         let mut wasm_printer = self.printer.borrow_mut().take().expect("run called only once");
+        let mut wasm_drive = self.drive.borrow_mut().take().expect("run called only once");
+        let wasm_audio = self.audio.borrow_mut().take().expect("run called only once");
 
         let mut framed = ironrdp_futures::LocalFuturesFramed::new(rdp_reader);
 
@@ -705,6 +795,12 @@ impl iron_remote_desktop::Session for Session {
 
         // Timer interval for driving clipboard lock timeouts (5 second interval)
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();
+        // RDPDR reads may complete after their server IRP handler returned.
+        // Match IronRDP's native client cadence: queue the completion from the
+        // browser callback, then emit it from an independent RDPDR poll turn.
+        // This avoids emitting a static-channel frame re-entrantly from a JS
+        // callback while the RDPDR channel is still settling the prior IRP.
+        let mut rdpdr_deferred_interval = IntervalStream::new(50).fuse();
 
         let disconnect_reason = 'outer: loop {
             let outputs = select! {
@@ -712,7 +808,12 @@ impl iron_remote_desktop::Session for Session {
                     let (action, payload) = frame.context("read frame")?;
                     trace!(?action, frame_length = payload.len(), "Frame received");
 
-                    active_stage.process(&mut image, action, &payload)?
+                    active_stage.process(&mut image, action, &payload).map_err(|error| {
+                        if let Some(ref drive) = wasm_drive {
+                            drive.report_diagnostic(format!("[DEBUG-rdpdrive-session] inbound processing failed: {error:#}"));
+                        }
+                        error
+                    })?
                 }
                 input_events = input_events.next() => {
                     let event = input_events.context("read next input events")?;
@@ -886,10 +987,67 @@ impl iron_remote_desktop::Session for Session {
                             }
                             Vec::new()
                         }
+                        RdpInputEvent::Drive(message) => {
+                            if let Some(ref mut wasm_drive) = wasm_drive {
+                                wasm_drive.process_message(message);
+                            } else {
+                                warn!("Redirected-drive event received, but no browser drive is configured");
+                            }
+                            Vec::new()
+                        }
+                        RdpInputEvent::DriveReadResponse { request_id, data, failed } => {
+                            if let Some(rdpdr) = active_stage.get_svc_processor_mut::<Rdpdr>() {
+                                if let Some(backend) = rdpdr.downcast_backend_mut::<WasmRdpdrBackend>() {
+                                    let queued = backend.complete_drive_read(request_id, data, failed);
+                                    if !queued {
+                                        if let Some(ref drive) = wasm_drive {
+                                            drive.report_diagnostic(format!("[DEBUG-rdpdrive-response] read id={request_id} status=no-pending-response"));
+                                        }
+                                    } else if let Some(ref drive) = wasm_drive {
+                                        drive.report_diagnostic(format!("[DEBUG-rdpdrive-response] read id={request_id} status=queued"));
+                                    }
+                                    Vec::new()
+                                } else {
+                                    warn!("Redirected-drive read response received, but no browser drive backend is configured");
+                                    Vec::new()
+                                }
+                            } else {
+                                warn!("Redirected-drive read response received, but RDPDR is unavailable");
+                                Vec::new()
+                            }
+                        }
+                        RdpInputEvent::Audio(message) => {
+                            if let Some(ref wasm_audio) = wasm_audio {
+                                wasm_audio.process_message(message);
+                            } else {
+                                warn!("Audio event received, but no audio playback is configured");
+                            }
+                            Vec::new()
+                        }
                         RdpInputEvent::TerminateSession => {
                             active_stage.graceful_shutdown()
                                 .context("graceful shutdown")?
                         }
+                    }
+                }
+                _ = rdpdr_deferred_interval.next() => {
+                    let messages = if let Some(rdpdr) = active_stage.get_svc_processor_mut::<Rdpdr>() {
+                        rdpdr.downcast_backend_mut::<WasmRdpdrBackend>()
+                            .map_or_else(Vec::new, WasmRdpdrBackend::poll_deferred_messages)
+                    } else {
+                        Vec::new()
+                    };
+                    if messages.is_empty() {
+                        Vec::new()
+                    } else {
+                        let completion_count = messages.len();
+                        let frame = active_stage
+                            .process_svc_processor_messages(SvcProcessorMessages::<Rdpdr>::new(messages))
+                            .map_err(|error| anyhow::anyhow!("encode deferred redirected-drive responses: {error:#}"))?;
+                        if let Some(ref drive) = wasm_drive {
+                            drive.report_diagnostic(format!("[DEBUG-rdpdrive-response] deferred-poll completions={completion_count} frame_bytes={}", frame.len()));
+                        }
+                        vec![ActiveStageOutput::ResponseFrame(frame)]
                     }
                 }
                 _ = cleanup_interval.next() => {
@@ -1271,6 +1429,19 @@ impl iron_remote_desktop::Session for Session {
 
                 return Ok(JsValue::NULL);
             };
+            |submit_drive_read: JsValue| {
+                let obj = into_object(submit_drive_read)?;
+                let request_id = get_u32(&obj, "request_id")?;
+                let failed = get_bool(&obj, "is_error")?;
+                let data_val = js_sys::Reflect::get(&obj, &JsValue::from_str("data"))
+                    .map_err(|e| IronError::from(anyhow::anyhow!("get property `data`: {e:?}")))?;
+                let data = js_sys::Uint8Array::new(&data_val).to_vec();
+                self.input_events_tx
+                    .unbounded_send(RdpInputEvent::DriveReadResponse { request_id, data, failed })
+                    .context("send redirected-drive read response")
+                    .map_err(IronError::from)?;
+                return Ok(JsValue::NULL);
+            };
         }
 
         Err(
@@ -1354,6 +1525,60 @@ fn parse_print_job_stream_callbacks(callbacks: JsValue) -> anyhow::Result<JsPrin
     })
 }
 
+fn parse_drive_callbacks(callbacks: JsValue) -> anyhow::Result<JsDriveCallbacks> {
+    let callbacks = callbacks
+        .dyn_into::<js_sys::Object>()
+        .map_err(|_| anyhow::anyhow!("expected object"))?;
+    Ok(JsDriveCallbacks {
+        on_file_read: get_required_function(&callbacks, "onFileRead")?,
+        on_file_written: get_required_function(&callbacks, "onFileWritten")?,
+        on_diagnostic: get_optional_function(&callbacks, "onDriveDiagnostic")?,
+    })
+}
+
+fn parse_audio_playback_callbacks(callbacks: JsValue) -> anyhow::Result<JsAudioCallbacks> {
+    let callbacks = callbacks
+        .dyn_into::<js_sys::Object>()
+        .map_err(|_| anyhow::anyhow!("expected object"))?;
+    Ok(JsAudioCallbacks {
+        on_pcm: get_required_function(&callbacks, "onPcm")?,
+    })
+}
+
+/// Convert the browser's approved display geometry into GCC Client Monitor
+/// Data. Coordinates are already normalized by the page so the RDP framebuffer
+/// is one contiguous virtual desktop even when a physical monitor sits left or
+/// above the primary display.
+fn parse_monitor_layout(value: JsValue) -> anyhow::Result<ironrdp::pdu::gcc::ClientMonitorData> {
+    let values = js_sys::Array::from(&value);
+    if values.length() < 2 || values.length() > 16 {
+        anyhow::bail!("monitor layout must contain between 2 and 16 displays");
+    }
+    let mut monitors = Vec::with_capacity(values.length() as usize);
+    let mut primary_count = 0;
+    for value in values.iter() {
+        let object = value.dyn_into::<js_sys::Object>().map_err(|_| anyhow::anyhow!("monitor must be an object"))?;
+        let left = get_i32(&object, "left").map_err(|_| anyhow::anyhow!("invalid left"))?;
+        let top = get_i32(&object, "top").map_err(|_| anyhow::anyhow!("invalid top"))?;
+        let right = get_i32(&object, "right").map_err(|_| anyhow::anyhow!("invalid right"))?;
+        let bottom = get_i32(&object, "bottom").map_err(|_| anyhow::anyhow!("invalid bottom"))?;
+        if right < left || bottom < top {
+            anyhow::bail!("monitor rectangle is empty");
+        }
+        let primary = get_bool(&object, "primary").map_err(|_| anyhow::anyhow!("invalid primary"))?;
+        if primary { primary_count += 1; }
+        monitors.push(ironrdp::pdu::gcc::Monitor {
+            left,
+            top,
+            right,
+            bottom,
+            flags: if primary { ironrdp::pdu::gcc::MonitorFlags::PRIMARY } else { ironrdp::pdu::gcc::MonitorFlags::empty() },
+        });
+    }
+    if primary_count != 1 { anyhow::bail!("monitor layout requires exactly one primary display"); }
+    Ok(ironrdp::pdu::gcc::ClientMonitorData { monitors })
+}
+
 fn get_required_function(obj: &js_sys::Object, key: &str) -> anyhow::Result<js_sys::Function> {
     get_optional_function(obj, key)?.with_context(|| format!("missing function `{key}`"))
 }
@@ -1369,6 +1594,30 @@ fn get_optional_function(obj: &js_sys::Object, key: &str) -> anyhow::Result<Opti
     val.dyn_into::<js_sys::Function>()
         .map(Some)
         .map_err(|_| anyhow::anyhow!("property `{key}` must be a function"))
+}
+
+fn parse_drive_seed_files(value: JsValue) -> anyhow::Result<Vec<DriveSeedFile>> {
+    let values = js_sys::Array::from(&value);
+    values.iter().map(|value| {
+        let object = value.dyn_into::<js_sys::Object>().map_err(|_| anyhow::anyhow!("drive file must be an object"))?;
+        let name = js_sys::Reflect::get(&object, &JsValue::from_str("name"))
+            .map_err(|_| anyhow::anyhow!("drive file name missing"))?
+            .as_string().filter(|name| !name.is_empty()).ok_or_else(|| anyhow::anyhow!("drive file name invalid"))?;
+        let size = js_sys::Reflect::get(&object, &JsValue::from_str("size"))
+            .map_err(|_| anyhow::anyhow!("drive file size missing"))?
+            .as_f64()
+            .filter(|size| size.is_finite() && *size >= 0.0 && size.fract() == 0.0 && *size <= 9_007_199_254_740_991.0)
+            .ok_or_else(|| anyhow::anyhow!("drive file size invalid"))? as u64;
+        // `File.lastModified` is native browser metadata. Keep it in Unix
+        // milliseconds here so the RDPDR backend can produce exact FILETIME
+        // fields without losing precision through JavaScript's Number type.
+        let last_modified = js_sys::Reflect::get(&object, &JsValue::from_str("last_modified"))
+            .map_err(|_| anyhow::anyhow!("drive file last_modified missing"))?
+            .as_f64()
+            .filter(|time| time.is_finite() && *time >= 0.0 && time.fract() == 0.0 && *time <= 253_402_300_799_999.0)
+            .ok_or_else(|| anyhow::anyhow!("drive file last_modified invalid"))? as i64;
+        Ok(DriveSeedFile { name, size, last_modified })
+    }).collect()
 }
 
 #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1458,7 +1707,9 @@ fn build_config(
     domain: Option<String>,
     client_name: String,
     desktop_size: DesktopSize,
+    monitor_layout: Option<ironrdp::pdu::gcc::ClientMonitorData>,
     legacy_graphics: bool,
+    enable_audio_playback: bool,
 ) -> connector::Config {
     // Win7-class servers need 32-bpp lossless bitmaps and no advertised codecs.
     let bitmap = if legacy_graphics {
@@ -1493,7 +1744,7 @@ fn build_config(
             width: desktop_size.width,
             height: desktop_size.height,
         },
-        monitor_layout: None,
+        monitor_layout,
         bitmap: Some(bitmap),
         #[expect(
             clippy::arithmetic_side_effects,
@@ -1511,7 +1762,7 @@ fn build_config(
         compression_type: None,
         enable_server_pointer: true,
         autologon: false,
-        enable_audio_playback: false,
+        enable_audio_playback,
         enable_audio_capture: false,
         request_data: None,
         pointer_software_rendering: false,
@@ -1580,6 +1831,8 @@ struct ConnectParams {
     printer_device_id: u32,
     printer_name: String,
     printer_driver_name: String,
+    drive_backend: Option<crate::drive::WasmDriveBackend>,
+    audio_backend: Option<WasmAudioBackend>,
     /// Matches the `client_name` in the connector config; used as the
     /// `computer_name` when constructing the `Rdpdr` processor.
     computer_name: String,
@@ -1632,6 +1885,8 @@ async fn connect(
         printer_device_id,
         printer_name,
         printer_driver_name,
+        drive_backend,
+        audio_backend,
         computer_name,
         use_display_control,
     }: ConnectParams,
@@ -1647,18 +1902,26 @@ async fn connect(
         connector.attach_static_channel(CliprdrClient::new(Box::new(clipboard_backend)));
     }
 
-    if let Some(printer_backend) = printer_backend {
+    let rdpdr_backend = WasmRdpdrBackend::new(drive_backend, printer_backend);
+    if let Some(audio_backend) = audio_backend {
+        connector.attach_static_channel(Rdpsnd::new(Box::new(audio_backend)));
+    } else if rdpdr_backend.is_some() {
         // Windows servers only speak on RDPDR when RDPSND is advertised too
-        // (MS-RDPEFS Appendix A<1>). We do not play audio in the web client,
-        // but the no-op RDPSND processor satisfies that channel dependency.
+        // (MS-RDPEFS Appendix A<1>). The no-op processor satisfies that
+        // channel dependency when server-audio playback is disabled.
         connector.attach_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)));
-        connector.attach_static_channel(
-            Rdpdr::new(Box::new(printer_backend), computer_name).with_printer_driver(
-                printer_device_id,
-                printer_name,
-                printer_driver_name,
-            ),
-        );
+    }
+    if let Some(rdpdr_backend) = rdpdr_backend {
+        let has_drive = rdpdr_backend.has_drive();
+        let has_printer = rdpdr_backend.has_printer();
+        let mut rdpdr = Rdpdr::new(Box::new(rdpdr_backend), computer_name);
+        if has_drive {
+            rdpdr = rdpdr.with_drives(Some(vec![(1, "StoneVeyl Files".to_owned())]));
+        }
+        if has_printer {
+            rdpdr = rdpdr.with_printer_driver(printer_device_id, printer_name, printer_driver_name);
+        }
+        connector.attach_static_channel(rdpdr);
     }
 
     if use_display_control {
