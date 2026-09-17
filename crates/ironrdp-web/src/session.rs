@@ -268,6 +268,14 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             |pcb: String| { self.0.borrow_mut().pcb = Some(pcb) };
             |vmconnect: String| { self.0.borrow_mut().vmconnect = Some(vmconnect) };
             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
+            // Keep the browser client's default identity unless an embedding
+            // application deliberately brands it. Windows uses this value in
+            // redirected-drive names such as "S on <client name>".
+            |client_name: String| {
+                if !client_name.trim().is_empty() {
+                    self.0.borrow_mut().client_name = client_name;
+                }
+            };
             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
             |monitor_layout: JsValue| {
                 match parse_monitor_layout(monitor_layout) {
